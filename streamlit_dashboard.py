@@ -7,6 +7,7 @@ Updates requested:
 - Sidebar settings include small explanations (via help=...).
 - Fix: jitter/phase settings do NOT affect INT2 when using uploaded data (correct behavior).
   Added optional "Uploaded data testing knobs" to perturb uploaded probe timestamps so INT2 changes for demos.
+- Added "Data Preview" section in Overview with option to view samples or more rows, and download CSV.
 """
 
 from __future__ import annotations
@@ -226,6 +227,36 @@ def rca_topk(rca_model, row_feats: pd.DataFrame, k: int = 3) -> pd.DataFrame:
     return pd.DataFrame({"Likely cause": [classes[i] for i in top_idx], "Probability": [float(probs[i]) for i in top_idx]})
 
 
+def preview_block(title: str, df: pd.DataFrame | None):
+    st.markdown(f"#### {title}")
+    if df is None:
+        st.info("Not available.")
+        return
+
+    st.caption(f"Rows: {len(df):,} | Columns: {len(df.columns)}")
+
+    c1, c2, c3 = st.columns([1.2, 1.2, 1.8])
+    with c1:
+        show_all = st.checkbox("View all rows", value=False, key=f"{title}_all")
+    with c2:
+        max_rows = st.slider("Max rows to display", 50, 5000, 500, 50, key=f"{title}_max")
+    with c3:
+        st.download_button(
+            "Download CSV",
+            df_to_csv_bytes(df),
+            file_name=f"{title.lower().replace(' ', '_')}.csv",
+            mime="text/csv",
+            key=f"{title}_dl",
+        )
+
+    if show_all:
+        st.dataframe(df.head(max_rows), use_container_width=True)
+        if len(df) > max_rows:
+            st.warning(f"Showing first {max_rows:,} rows only (to keep the app fast).")
+    else:
+        st.dataframe(df.head(25), use_container_width=True)
+
+
 # -----------------------------
 # Sidebar
 # -----------------------------
@@ -398,7 +429,6 @@ if run_btn:
 
 # If not trained yet: templates are still usable; other tabs show guidance
 if "trained" not in st.session_state:
-    # Put top metrics placeholders at top
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Anomaly threshold", "—")
     c2.metric("Precision", "—")
@@ -427,6 +457,7 @@ def load_uploaded_csv(uploaded_file) -> pd.DataFrame:
 
 using_labels = False
 events = []
+labels_df = None
 
 # -----------------------------
 # Build ds_base from chosen source
@@ -434,9 +465,9 @@ events = []
 if data_source == "Simulated":
     snmp, probes, labels, events, ds_base = trained["train_data"]
     using_labels = True
+    labels_df = labels
 else:
     if snmp_upload is None or probes_upload is None:
-        # Still show top metrics (trained model exists), but warn in Overview
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Anomaly threshold", f"{model_out['threshold']:.2f}")
         c2.metric("Precision", f"{model_out['precision']:.3f}")
@@ -469,7 +500,6 @@ else:
                 st.error(f"Probes must include services {sorted(required)}. Found: {sorted(present)}")
             st.stop()
 
-    # OPTIONAL: perturb probe timestamps (uploaded data sensitivity testing)
     probes_for_scoring = apply_uploaded_probe_perturbation(
         probes,
         enable=perturb_enable,
@@ -489,6 +519,7 @@ else:
         ds_base["cause"] = ds_base["cause"].fillna("")
         ds_base["primary_cause"] = ds_base["cause"].apply(primary_cause)
         using_labels = True
+        labels_df = labels
 
 # Ensure features exist, then score
 ds_base, missing_feats = ensure_feature_columns(ds_base, feats)
@@ -556,9 +587,37 @@ with tab_overview:
         use_container_width=True
     )
 
+    # -----------------------------
+    # Data Preview section (NEW)
+    # -----------------------------
+    st.divider()
+    st.subheader("Data Preview (Simulated / Uploaded)")
+
+    dataset_choice = st.selectbox(
+        "Choose which table to preview",
+        ["SNMP (raw)", "Probes (used)", "Minute Features (ds_base)", "Scored Output (ds)", "Labels (if available)"],
+        index=3,
+    )
+
+    if dataset_choice == "SNMP (raw)":
+        preview_block("SNMP_raw", snmp)
+    elif dataset_choice == "Probes (used)":
+        preview_block("Probes_used_for_scoring_and_INT2", probes_for_spec)
+    elif dataset_choice == "Minute Features (ds_base)":
+        preview_block("Minute_features_ds_base", ds_base)
+    elif dataset_choice == "Scored Output (ds)":
+        preview_block("Scored_output_ds", ds)
+    elif dataset_choice == "Labels (if available)":
+        if using_labels and labels_df is not None:
+            preview_block("Labels", labels_df)
+        else:
+            st.info("No labels available. Upload Labels CSV if you want to preview labels and compute confusion matrix.")
+
+    # -----------------------------
+    # Spec verification
+    # -----------------------------
     st.subheader("Specification verification (Report S1–S8, INT1–INT3)")
 
-    # Collapsed by default
     with st.expander("How each specification is calculated (proof rules)", expanded=False):
         st.markdown(
             """
@@ -644,7 +703,6 @@ with tab_rca:
 
     st.subheader("Telemetry around selected minute (linked)")
     window_s = st.slider("Plot window (seconds)", 120, 900, 300, 60)
-    # Use probes_for_spec for consistency when uploaded perturbation is enabled
     st.pyplot(plot_telemetry_window(snmp, probes_for_spec, int(b_sel), minute_val, int(window_s)))
 
 
