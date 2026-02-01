@@ -1,13 +1,14 @@
 """
-streamlit_dashboard.py — Proof-of-Spec Dashboard (UPDATED)
+streamlit_dashboard.py — Proof-of-Spec Dashboard (FULL)
 
-Updates requested:
-- Top metrics displayed at the very top of the page (above tabs).
-- "How each specification is calculated" is in the Overview tab and collapsed by default.
-- Sidebar settings include small explanations (via help=...).
-- Fix: jitter/phase settings do NOT affect INT2 when using uploaded data (correct behavior).
-  Added optional "Uploaded data testing knobs" to perturb uploaded probe timestamps so INT2 changes for demos.
-- Added "Data Preview" section in Overview with option to view samples or more rows, and download CSV.
+Updates included:
+- Run does NOT happen until "Run (train model)" is pressed.
+- Cross-device Streamlit caching fix:
+  - Cache by CSV bytes (not DataFrames) to avoid UnhashableParamError.
+- Spec table PASS/FAIL shown in green/red (no emojis).
+- RCA "Correct/Incorrect" shown in green/red (no emojis).
+- If multiple ground-truth causes exist, they are all displayed (list + joined text).
+- Overview includes a collapsed expander explaining how each spec is calculated.
 """
 
 from __future__ import annotations
@@ -39,16 +40,24 @@ EXPECTED_CAUSES = [
     "HTTPS_OUTAGE",
 ]
 
+# -----------------------------
+# Page config / styles
+# -----------------------------
 st.set_page_config(page_title="AI Proof-of-Spec Dashboard", layout="wide")
 st.title("Simulation-based Verification (Proof-of-Spec)")
 st.caption("Feasibility demo using simulated SNMP + probe telemetry (NOT the full prototype).")
 
-# Big table CSS
 st.markdown(
     """
     <style>
-    .big-spec-table table { font-size: 18px !important; }
-    .big-spec-table th, .big-spec-table td { padding: 10px 14px !important; }
+      .spec-pass { color: #1f7a1f; font-weight: 800; }
+      .spec-fail { color: #b00020; font-weight: 800; }
+      .rca-correct { color: #1f7a1f; font-weight: 800; }
+      .rca-incorrect { color: #b00020; font-weight: 800; }
+      .small-note { font-size: 0.9rem; opacity: 0.9; }
+
+      .big-spec-table table { font-size: 18px !important; }
+      .big-spec-table th, .big-spec-table td { padding: 10px 14px !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -56,7 +65,24 @@ st.markdown(
 
 
 # -----------------------------
-# Cached helpers
+# Stable serialization helpers
+# -----------------------------
+def df_to_csv_bytes_stable(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+
+def bytes_to_df(csv_bytes: bytes) -> pd.DataFrame:
+    return pd.read_csv(io.BytesIO(csv_bytes))
+
+
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    return buf.getvalue().encode("utf-8")
+
+
+# -----------------------------
+# Cached helpers (cache bytes, not DataFrames)
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def cached_simulate(cfg_dict: dict):
@@ -64,15 +90,21 @@ def cached_simulate(cfg_dict: dict):
 
 
 @st.cache_data(show_spinner=False)
-def cached_features(snmp: pd.DataFrame, probes: pd.DataFrame):
+def cached_features_from_csv(snmp_csv: bytes, probes_csv: bytes) -> pd.DataFrame:
+    snmp = bytes_to_df(snmp_csv)
+    probes = bytes_to_df(probes_csv)
     return build_minute_features(snmp, probes)
 
 
 @st.cache_resource(show_spinner=False)
-def cached_train(ds: pd.DataFrame):
+def cached_train_from_csv(ds_csv: bytes):
+    ds = bytes_to_df(ds_csv)
     return train_anomaly_and_rca(ds)
 
 
+# -----------------------------
+# Core helpers
+# -----------------------------
 def ensure_feature_columns(df: pd.DataFrame, required_feats: list[str]) -> tuple[pd.DataFrame, list[str]]:
     out = df.copy()
     missing = []
@@ -95,35 +127,6 @@ def score_all(ds: pd.DataFrame, feats: list[str], anomaly_model, threshold: floa
     out["anom_prob"] = anomaly_model.predict_proba(out[feats])[:, 1]
     out["anom_pred"] = (out["anom_prob"] >= threshold).astype(int)
     return out
-
-
-def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    buf = io.StringIO()
-    df.to_csv(buf, index=False)
-    return buf.getvalue().encode("utf-8")
-
-
-def make_templates():
-    snmp_t = pd.DataFrame([{
-        "ts": 0, "building": 0, "device": "sw-0", "dtype": "SW",
-        "cpu": 18.0, "mem": 40.0, "if_util": 30.0, "if_errors": 0, "if_up": 1,
-        "parent": "", "role": "parent"
-    }])
-
-    probes_t = pd.DataFrame([
-        {"ts": 2, "building": 0, "service": "DNS",  "resp_time_s": 0.03, "success": 1},
-        {"ts": 2, "building": 0, "service": "DHCP", "resp_time_s": 0.22, "success": 1},
-        {"ts": 2, "building": 0, "service": "LMS",  "resp_time_s": 0.55, "success": 1},
-        {"ts": 2, "building": 0, "service": "WIFI", "resp_time_s": 0.08, "success": 1},
-        {"ts": 2, "building": 0, "service": "HTTP",  "resp_time_s": 0.35, "success": 1},
-        {"ts": 2, "building": 0, "service": "HTTPS", "resp_time_s": 0.40, "success": 1},
-    ])
-
-    labels_t = pd.DataFrame([{
-        "minute": 0, "building": 0, "is_anomaly": 0, "cause": "NORMAL"
-    }])
-
-    return snmp_t, probes_t, labels_t
 
 
 def validate_columns(df: pd.DataFrame, required: list[str], name: str):
@@ -149,11 +152,6 @@ def apply_uploaded_probe_perturbation(
     jitter_s: int,
     seed: int,
 ) -> pd.DataFrame:
-    """
-    Optional: modify uploaded probe timestamps so INT2 changes for demonstration/sensitivity testing.
-    - shift_s: constant shift applied to all probe ts
-    - jitter_s: random +/- jitter in seconds
-    """
     if not enable:
         return probes
 
@@ -167,9 +165,61 @@ def apply_uploaded_probe_perturbation(
         jit = rng.integers(-int(jitter_s), int(jitter_s) + 1, size=len(p))
         p["ts"] = p["ts"].astype(int) + jit.astype(int)
 
-    # keep timestamps non-negative
     p["ts"] = p["ts"].clip(lower=0).astype(int)
     return p
+
+
+def make_templates():
+    snmp_t = pd.DataFrame([{
+        "ts": 0, "building": 0, "device": "sw-0", "dtype": "SW",
+        "cpu": 18.0, "mem": 40.0, "if_util": 30.0, "if_errors": 0, "if_up": 1,
+        "parent": "", "role": "parent"
+    }])
+
+    probes_t = pd.DataFrame([
+        {"ts": 2, "building": 0, "service": "DNS",  "resp_time_s": 0.03, "success": 1},
+        {"ts": 2, "building": 0, "service": "DHCP", "resp_time_s": 0.22, "success": 1},
+        {"ts": 2, "building": 0, "service": "LMS",  "resp_time_s": 0.55, "success": 1},
+        {"ts": 2, "building": 0, "service": "WIFI", "resp_time_s": 0.08, "success": 1},
+        {"ts": 2, "building": 0, "service": "HTTP",  "resp_time_s": 0.35, "success": 1},
+        {"ts": 2, "building": 0, "service": "HTTPS", "resp_time_s": 0.40, "success": 1},
+    ])
+
+    labels_t = pd.DataFrame([{
+        "minute": 0, "building": 0, "is_anomaly": 0, "cause": "NORMAL"
+    }])
+
+    return snmp_t, probes_t, labels_t
+
+
+def preview_block(title: str, df: pd.DataFrame | None):
+    st.markdown(f"#### {title}")
+    if df is None:
+        st.info("Not available.")
+        return
+
+    st.caption(f"Rows: {len(df):,} | Columns: {len(df.columns)}")
+
+    c1, c2, c3 = st.columns([1.2, 1.2, 1.8])
+    with c1:
+        show_all = st.checkbox("View all rows", value=False, key=f"{title}_all")
+    with c2:
+        max_rows = st.slider("Max rows to display", 50, 5000, 500, 50, key=f"{title}_max")
+    with c3:
+        st.download_button(
+            "Download CSV",
+            df_to_csv_bytes(df),
+            file_name=f"{title.lower().replace(' ', '_')}.csv",
+            mime="text/csv",
+            key=f"{title}_dl",
+        )
+
+    if show_all:
+        st.dataframe(df.head(max_rows), use_container_width=True)
+        if len(df) > max_rows:
+            st.warning(f"Showing first {max_rows:,} rows only (to keep the app fast).")
+    else:
+        st.dataframe(df.head(25), use_container_width=True)
 
 
 def plot_telemetry_window(snmp: pd.DataFrame, probes: pd.DataFrame, building: int, center_minute: int, window_s: int = 300):
@@ -220,41 +270,8 @@ def plot_telemetry_window(snmp: pd.DataFrame, probes: pd.DataFrame, building: in
     return fig
 
 
-def rca_topk(rca_model, row_feats: pd.DataFrame, k: int = 3) -> pd.DataFrame:
-    probs = rca_model.predict_proba(row_feats)[0]
-    classes = list(rca_model.classes_)
-    top_idx = np.argsort(probs)[-k:][::-1]
-    return pd.DataFrame({"Likely cause": [classes[i] for i in top_idx], "Probability": [float(probs[i]) for i in top_idx]})
-
-
-def preview_block(title: str, df: pd.DataFrame | None):
-    st.markdown(f"#### {title}")
-    if df is None:
-        st.info("Not available.")
-        return
-
-    st.caption(f"Rows: {len(df):,} | Columns: {len(df.columns)}")
-
-    c1, c2, c3 = st.columns([1.2, 1.2, 1.8])
-    with c1:
-        show_all = st.checkbox("View all rows", value=False, key=f"{title}_all")
-    with c2:
-        max_rows = st.slider("Max rows to display", 50, 5000, 500, 50, key=f"{title}_max")
-    with c3:
-        st.download_button(
-            "Download CSV",
-            df_to_csv_bytes(df),
-            file_name=f"{title.lower().replace(' ', '_')}.csv",
-            mime="text/csv",
-            key=f"{title}_dl",
-        )
-
-    if show_all:
-        st.dataframe(df.head(max_rows), use_container_width=True)
-        if len(df) > max_rows:
-            st.warning(f"Showing first {max_rows:,} rows only (to keep the app fast).")
-    else:
-        st.dataframe(df.head(25), use_container_width=True)
+def html_badge(text: str, cls: str) -> str:
+    return f"<span class='{cls}'>{text}</span>"
 
 
 # -----------------------------
@@ -265,76 +282,41 @@ snmp_t, probes_t, labels_t = make_templates()
 with st.sidebar:
     st.header("Simulation Settings (train model)")
     with st.form("sim_form"):
-        duration = st.slider(
-            "Duration (minutes)",
-            60, 720, 240, 60,
-            help="Length of simulated timeline used for training/verification in 'Simulated' mode."
-        )
-        buildings = st.slider(
-            "Buildings",
-            2, 20, 8, 1,
-            help="Number of buildings (sites) in simulated training data."
-        )
-        aps = st.slider(
-            "APs per building",
-            5, 50, 14, 1,
-            help="Number of access points per building in simulated SNMP inventory."
-        )
-        seed = st.number_input(
-            "Random seed",
-            value=7, step=1,
-            help="Controls simulation randomness. Same seed → same dataset."
-        )
+        duration = st.slider("Duration (minutes)", 60, 720, 240, 60,
+                             help="Length of simulated timeline used for training/verification in 'Simulated' mode.")
+        buildings = st.slider("Buildings", 2, 20, 8, 1,
+                              help="Number of buildings (sites) in simulated training data.")
+        aps = st.slider("APs per building", 5, 50, 14, 1,
+                        help="Number of access points per building in simulated SNMP inventory.")
+        seed = st.number_input("Random seed", value=7, step=1,
+                               help="Controls simulation randomness. Same seed → same dataset.")
 
-        snmp_interval = st.selectbox(
-            "SNMP interval (S1)",
-            [60, 30, 15], index=0,
-            help="SNMP polling interval used in simulation (seconds). S1 expects ≤ 60s."
-        )
-        probe_interval = st.selectbox(
-            "Probe interval (S6 < 15s)",
-            [14, 12, 10, 5], index=2,
-            help="Probe execution interval (seconds). S6 expects < 15s."
-        )
+        snmp_interval = st.selectbox("SNMP interval (S1)", [60, 30, 15], index=0,
+                                     help="SNMP polling interval (seconds). S1 expects ≤ 60s.")
+        probe_interval = st.selectbox("Probe interval (S6 < 15s)", [14, 12, 10, 5], index=2,
+                                      help="Probe execution interval (seconds). S6 expects < 15s.")
 
-        probe_phase = st.slider(
-            "Probe phase offset (INT2 realism)",
-            0, 9, 2, 1,
-            help="Shifts probe schedule relative to SNMP polls to avoid a perfect 0s INT2. Only affects SIMULATED data."
-        )
-        snmp_jitter = st.slider(
-            "SNMP jitter (seconds)",
-            0, 5, 2, 1,
-            help="Random +/- jitter added to simulated SNMP timestamps. Only affects SIMULATED data."
-        )
-        probe_jitter = st.slider(
-            "Probe jitter (seconds)",
-            0, 5, 2, 1,
-            help="Random +/- jitter added to simulated probe timestamps. Only affects SIMULATED data."
-        )
+        probe_phase = st.slider("Probe phase offset (INT2 realism)", 0, 9, 2, 1,
+                                help="Shifts probe schedule vs SNMP polls (SIMULATED only).")
+        snmp_jitter = st.slider("SNMP jitter (seconds)", 0, 5, 2, 1,
+                                help="Random +/- jitter added to simulated SNMP timestamps (SIMULATED only).")
+        probe_jitter = st.slider("Probe jitter (seconds)", 0, 5, 2, 1,
+                                 help="Random +/- jitter added to simulated probe timestamps (SIMULATED only).")
 
-        include_http = st.checkbox(
-            "Simulate HTTP/HTTPS probes",
-            value=True,
-            help="Adds HTTP/HTTPS services to simulated probe data (and features if present)."
-        )
+        include_http = st.checkbox("Simulate HTTP/HTTPS probes", value=True,
+                                   help="Adds HTTP/HTTPS to simulated probe data (and features if present).")
 
         st.divider()
         run_btn = st.form_submit_button("Run (train model)")
 
     st.divider()
     st.header("Data Source (scoring/verification)")
-    data_source = st.radio(
-        "Choose source",
-        ["Simulated", "Uploaded CSV"],
-        help="Simulated uses the generated dataset. Uploaded uses your CSV data and scores it with the trained model."
-    )
+    data_source = st.radio("Choose source", ["Simulated", "Uploaded CSV"],
+                           help="Uploaded scores your CSV using the trained model.")
 
-    strict_services = st.checkbox(
-        "Strict: require DNS, DHCP, LMS, WIFI in probes",
-        value=True if data_source == "Uploaded CSV" else False,
-        help="If enabled, uploaded probes must include these core services."
-    )
+    strict_services = st.checkbox("Strict: require DNS, DHCP, LMS, WIFI in probes",
+                                  value=True if data_source == "Uploaded CSV" else False,
+                                  help="If enabled, uploaded probes must include these core services.")
 
     snmp_upload = probes_upload = labels_upload = None
     if data_source == "Uploaded CSV":
@@ -344,10 +326,7 @@ with st.sidebar:
 
         st.divider()
         st.subheader("Uploaded data testing knobs (optional)")
-        st.caption(
-            "These DO NOT represent real monitoring. They are only for sensitivity testing "
-            "to show INT2 changes when probe timestamps shift."
-        )
+        st.caption("Only for sensitivity demos to make INT2 change.")
         perturb_enable = st.checkbox("Apply timestamp shift/jitter to uploaded probes", value=False)
         perturb_shift = st.slider("Probe time shift (seconds)", -10, 10, 0, 1)
         perturb_jitter = st.slider("Probe time jitter (seconds)", 0, 5, 0, 1)
@@ -360,7 +339,7 @@ with st.sidebar:
 
 
 # -----------------------------
-# Tabs (Templates always available)
+# Tabs
 # -----------------------------
 tab_overview, tab_rca, tab_plots, tab_templates = st.tabs(
     ["Overview (All Buildings)", "RCA + Linked Plot", "Plots", "Templates & Upload"]
@@ -383,7 +362,7 @@ with tab_templates:
 - `cause`: one or more causes separated by semicolon `;`
 """
     )
-    st.write("Report-aligned expected causes:")
+    st.write("Expected causes used by the demo:")
     st.code("\n".join(EXPECTED_CAUSES))
 
     st.divider()
@@ -394,7 +373,7 @@ with tab_templates:
 
 
 # -----------------------------
-# Training
+# Training (only on button press)
 # -----------------------------
 if run_btn:
     cfg_dict = dict(
@@ -412,14 +391,18 @@ if run_btn:
 
     with st.spinner("Simulating training data + training models..."):
         dev_tr, snmp_tr, probes_tr, labels_tr, events_tr = cached_simulate(cfg_dict)
-        feat_tr = cached_features(snmp_tr, probes_tr)
+
+        feat_tr = cached_features_from_csv(
+            df_to_csv_bytes_stable(snmp_tr),
+            df_to_csv_bytes_stable(probes_tr),
+        )
 
         ds_tr = feat_tr.merge(labels_tr, on=["minute", "building"], how="left")
         ds_tr["is_anomaly"] = ds_tr["is_anomaly"].fillna(0).astype(int)
         ds_tr["cause"] = ds_tr["cause"].fillna("")
         ds_tr["primary_cause"] = ds_tr["cause"].apply(primary_cause)
 
-        model_out = cached_train(ds_tr)
+        model_out = cached_train_from_csv(df_to_csv_bytes_stable(ds_tr))
 
         st.session_state["trained"] = {
             "cfg_dict": cfg_dict,
@@ -427,7 +410,7 @@ if run_btn:
             "train_data": (snmp_tr, probes_tr, labels_tr, events_tr, ds_tr),
         }
 
-# If not trained yet: templates are still usable; other tabs show guidance
+# Not trained yet: templates usable; other tabs guide user
 if "trained" not in st.session_state:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Anomaly threshold", "—")
@@ -436,24 +419,22 @@ if "trained" not in st.session_state:
     c4.metric("Rows (minute x building)", "—")
 
     with tab_overview:
-        st.info("Press **Run (train model)** in the sidebar first.")
+        st.info("Press Run (train model) in the sidebar first.")
     with tab_rca:
-        st.info("Press **Run (train model)** first.")
+        st.info("Press Run (train model) first.")
     with tab_plots:
-        st.info("Press **Run (train model)** first.")
+        st.info("Press Run (train model) first.")
     st.stop()
 
+# -----------------------------
+# Use trained artifacts
+# -----------------------------
 trained = st.session_state["trained"]
 cfg_dict = trained["cfg_dict"]
 model_out = trained["model_out"]
 feats = model_out["features"]
 anom_model = model_out["anomaly_model"]
 rca_model = model_out["rca_model"]
-
-
-def load_uploaded_csv(uploaded_file) -> pd.DataFrame:
-    return pd.read_csv(uploaded_file)
-
 
 using_labels = False
 events = []
@@ -466,6 +447,7 @@ if data_source == "Simulated":
     snmp, probes, labels, events, ds_base = trained["train_data"]
     using_labels = True
     labels_df = labels
+    probes_for_scoring = probes
 else:
     if snmp_upload is None or probes_upload is None:
         c1, c2, c3, c4 = st.columns(4)
@@ -473,13 +455,12 @@ else:
         c2.metric("Precision", f"{model_out['precision']:.3f}")
         c3.metric("Recall", f"{model_out['recall']:.3f}")
         c4.metric("Rows (minute x building)", "—")
-
         with tab_overview:
             st.warning("Upload both SNMP and Probes CSV in the sidebar to score uploaded data.")
         st.stop()
 
-    snmp = load_uploaded_csv(snmp_upload)
-    probes = load_uploaded_csv(probes_upload)
+    snmp = pd.read_csv(snmp_upload)
+    probes = pd.read_csv(probes_upload)
 
     validate_columns(snmp, ["ts","building","device","dtype","cpu","mem","if_util","if_errors","if_up","parent","role"], "SNMP CSV")
     validate_columns(probes, ["ts","building","service","resp_time_s","success"], "Probes CSV")
@@ -490,12 +471,6 @@ else:
         required = {"DNS", "DHCP", "LMS", "WIFI"}
         present = set(probes["service"].unique())
         if not required.issubset(present):
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Anomaly threshold", f"{model_out['threshold']:.2f}")
-            c2.metric("Precision", f"{model_out['precision']:.3f}")
-            c3.metric("Recall", f"{model_out['recall']:.3f}")
-            c4.metric("Rows (minute x building)", "—")
-
             with tab_overview:
                 st.error(f"Probes must include services {sorted(required)}. Found: {sorted(present)}")
             st.stop()
@@ -508,11 +483,14 @@ else:
         seed=int(perturb_seed),
     )
 
-    feat_up = cached_features(snmp, probes_for_scoring)
+    feat_up = cached_features_from_csv(
+        df_to_csv_bytes_stable(snmp),
+        df_to_csv_bytes_stable(probes_for_scoring),
+    )
     ds_base = feat_up.copy()
 
     if labels_upload is not None:
-        labels = load_uploaded_csv(labels_upload)
+        labels = pd.read_csv(labels_upload)
         validate_columns(labels, ["minute","building","is_anomaly","cause"], "Labels CSV")
         ds_base = ds_base.merge(labels, on=["minute","building"], how="left")
         ds_base["is_anomaly"] = ds_base["is_anomaly"].fillna(0).astype(int)
@@ -524,11 +502,7 @@ else:
 # Ensure features exist, then score
 ds_base, missing_feats = ensure_feature_columns(ds_base, feats)
 if missing_feats:
-    st.warning(
-        "Scoring data is missing some features expected by the trained model. "
-        "They were filled with defaults (accuracy may drop): "
-        + ", ".join(missing_feats)
-    )
+    st.warning("Missing features filled with defaults (accuracy may drop): " + ", ".join(missing_feats))
 
 ds = score_all(ds_base.fillna(0.0), feats, anom_model, model_out["threshold"])
 
@@ -540,11 +514,8 @@ if "primary_cause" not in ds.columns:
 split = model_out["split_minute"]
 ds_test = ds[ds.minute > split].copy().reset_index(drop=True)
 
-# For spec verification: INT2 must use the *same probes* used for scoring when in Uploaded CSV mode
-if data_source == "Uploaded CSV":
-    probes_for_spec = probes_for_scoring
-else:
-    probes_for_spec = probes
+# probes_for_spec must match probes used for scoring (so INT2 and plots match)
+probes_for_spec = probes_for_scoring
 
 spec_df = build_spec_table(
     SimConfig(**cfg_dict),
@@ -558,7 +529,7 @@ spec_df = build_spec_table(
 )
 
 # -----------------------------
-# TOP METRICS (always at top)
+# TOP METRICS
 # -----------------------------
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Anomaly threshold", f"{model_out['threshold']:.2f}")
@@ -574,31 +545,26 @@ with tab_overview:
     st.subheader("All Buildings Overview (latest minute per building)")
     latest = ds.sort_values("minute").groupby("building").tail(1).copy()
 
-    def top1_cause(row):
-        if int(row["anom_pred"]) != 1:
+    def top1_cause_scalar(r):
+        if int(r["anom_pred"]) != 1:
             return "NORMAL"
-        probs = rca_model.predict_proba(row[feats].to_frame().T)[0]
-        cls = list(rca_model.classes_)
-        return str(cls[int(np.argmax(probs))])
+        probs = rca_model.predict_proba(r[feats].to_frame().T)[0]
+        classes = list(rca_model.classes_)
+        return str(classes[int(np.argmax(probs))])
 
-    latest["likely_cause_top1"] = latest.apply(top1_cause, axis=1)
+    latest["likely_cause_top1"] = latest.apply(top1_cause_scalar, axis=1)
     st.dataframe(
         latest[["building","minute","anom_prob","anom_pred","likely_cause_top1"]].sort_values("building"),
         use_container_width=True
     )
 
-    # -----------------------------
-    # Data Preview section (NEW)
-    # -----------------------------
     st.divider()
     st.subheader("Data Preview (Simulated / Uploaded)")
-
     dataset_choice = st.selectbox(
         "Choose which table to preview",
         ["SNMP (raw)", "Probes (used)", "Minute Features (ds_base)", "Scored Output (ds)", "Labels (if available)"],
         index=3,
     )
-
     if dataset_choice == "SNMP (raw)":
         preview_block("SNMP_raw", snmp)
     elif dataset_choice == "Probes (used)":
@@ -607,63 +573,74 @@ with tab_overview:
         preview_block("Minute_features_ds_base", ds_base)
     elif dataset_choice == "Scored Output (ds)":
         preview_block("Scored_output_ds", ds)
-    elif dataset_choice == "Labels (if available)":
+    else:
         if using_labels and labels_df is not None:
             preview_block("Labels", labels_df)
         else:
-            st.info("No labels available. Upload Labels CSV if you want to preview labels and compute confusion matrix.")
+            st.info("No labels available. Upload Labels CSV to enable label-based evaluation.")
 
-    # -----------------------------
-    # Spec verification
-    # -----------------------------
     st.subheader("Specification verification (Report S1–S8, INT1–INT3)")
 
-    with st.expander("How each specification is calculated (proof rules)", expanded=False):
+    with st.expander("How each specification is calculated (rules used by this dashboard)", expanded=False):
         st.markdown(
             """
-### Correlation rule (INT2)
-For each SNMP poll timestamp `t_SNMP` (per building), we choose the **nearest probe timestamp** `t_probe` (same building).
-We compute:
+This dashboard computes the proof table using `ai_verify.build_spec_table(...)`.
+Below is the rule-level definition used by this demo.
+
+S1 — SNMP Poll Interval
+- Measured: `cfg.snmp_interval_s`
+- Pass: `snmp_interval_s ≤ 60`
+
+S2 — Dashboard Query Time
+- Measured: average time to run a dashboard-like aggregation over the per-minute dataset
+- Typical operation: `groupby(building).mean()` on common columns
+- Pass: `< 10 seconds`
+
+S3a / S3b — Anomaly Detection Quality
+- Measured: precision and recall on the test split (simulated labels; or uploaded labels if provided)
+- Pass: per your report thresholds
+
+S5 — Root Cause Analysis Time
+- Measured: time to run RCA inference (`predict_proba`) over a small batch of anomalous rows
+- Pass: `≤ 50 seconds`
+
+S6 — Probe Interval
+- Measured: `cfg.probe_interval_s`
+- Pass: `< 15 seconds`
+
+S7 — Duplicate Alert Reduction
+- Raw alerts: probe failures + probe SLA violations + SNMP congestion/errors/down signals
+- Dedup alerts: unique incidents by `(building, minute)` after correlation
+- Measured: `reduction% = (raw - dedup) / raw × 100`
+- Pass: `≥ 30%`
+
+S8 — Feature-Build Throughput
+- Measured: records/sec throughput of building minute features from SNMP + probes
+- Pass: `≥ 50 records/sec` (or your report threshold)
+
+INT1 — Detection Latency
+- Simulated-only: worst-case time between injected event start and first predicted anomaly minute
+- Pass: `≤ 120 seconds`
+
+INT2 — Timestamp Alignment (Correlation)
+For each SNMP timestamp `t_SNMP` (per building), select the nearest probe timestamp `t_probe` (same building):
 - `alignment_error = |t_SNMP - t_probe|`
+- Measured INT2 = `max(alignment_error)` over all samples/buildings
+- Pass: `≤ 5 seconds`
 
-**Measured INT2 = max(alignment_error) across all SNMP samples and buildings.**  
-This matches: “correlate device-level (SNMP) and service-level (probe) data with timestamp alignment error ≤ ±5 seconds”.
-
-> Note: In **Uploaded CSV** mode, simulation jitter/phase settings do not change your uploaded timestamps.  
-> If you want to demonstrate INT2 changing, enable “Uploaded data testing knobs”.
-
-### S1
-Measured = `snmp_interval_s` (simulation setting). PASS if ≤ 60s.
-
-### S2
-Measured = average time for a groupby/mean “dashboard-like” query over common columns. PASS if < 10s.
-
-### S3a / S3b
-Measured = anomaly model precision / recall on the labeled test split of the simulated dataset.
-
-### S5
-Measured = time to run RCA `predict_proba()` over a small batch of anomaly rows. PASS if ≤ 50s.
-
-### S6
-Measured = `probe_interval_s` (simulation setting). PASS if < 15s.
-
-### S7
-Raw alerts include: probe failures + probe SLA violations + SNMP congestion/errors/down.  
-Dedup alerts count unique `(building, minute)` tickets.  
-Reduction% = (raw - dedup) / raw × 100. PASS if ≥ 30%.
-
-### S8
-Measured = records/sec to build minute features once from SNMP+probes. PASS if ≥ 50 r/s.
-
-### INT1
-Measured = worst-case time between an injected event start and first predicted anomaly minute (simulated only). PASS if ≤ 120s.
+Note:
+- In Uploaded CSV mode, simulation jitter/phase does not change uploaded timestamps.
+- To demonstrate sensitivity, enable “Uploaded data testing knobs”.
 """
         )
 
     spec_show = spec_df.copy()
-    spec_show["Pass"] = spec_show["Pass"].apply(lambda x: "✅ PASS" if x else "❌ FAIL")
-    st.markdown('<div class="big-spec-table">', unsafe_allow_html=True)
-    st.table(spec_show)
+    spec_show["Pass"] = spec_show["Pass"].apply(
+        lambda x: html_badge("PASS", "spec-pass") if x else html_badge("FAIL", "spec-fail")
+    )
+
+    st.markdown("<div class='big-spec-table'>", unsafe_allow_html=True)
+    st.markdown(spec_show.to_html(index=False, escape=False), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -673,33 +650,83 @@ Measured = worst-case time between an injected event start and first predicted a
 with tab_rca:
     st.subheader("RCA (Likely Cause) + Linked Plot")
 
-    rca_mode = st.radio("Pick rows for RCA", ["Pick any minute", "Only predicted anomaly minutes"], horizontal=True)
+    rca_mode = st.radio(
+        "Pick rows for RCA",
+        ["Pick any minute", "Only predicted anomaly minutes"],
+        horizontal=True
+    )
 
     b_sel = st.selectbox("Building", sorted(ds["building"].unique().tolist()), index=0)
     ds_b = ds[ds["building"] == b_sel].sort_values("minute").reset_index(drop=True)
 
     if rca_mode == "Pick any minute":
         idx = st.slider("Minute index", 0, len(ds_b) - 1, min(10, len(ds_b) - 1))
-        row = ds_b.iloc[idx:idx+1].copy()
+        row = ds_b.iloc[idx:idx + 1].copy()
     else:
         anom_rows = ds_b[ds_b["anom_pred"] == 1].reset_index(drop=True)
         if len(anom_rows) == 0:
             st.warning("No predicted anomaly minutes for this building.")
             st.stop()
         idx = st.slider("Anomaly minute index", 0, len(anom_rows) - 1, 0)
-        row = anom_rows.iloc[idx:idx+1].copy()
+        row = anom_rows.iloc[idx:idx + 1].copy()
 
     minute_val = int(row["minute"].iloc[0])
-    st.write(f"Minute bucket: **[{minute_val}, {minute_val+60})**")
-    st.write(f"Anomaly probability: **{float(row['anom_prob'].iloc[0]):.3f}** | pred: **{int(row['anom_pred'].iloc[0])}**")
+    anom_prob = float(row["anom_prob"].iloc[0])
+    anom_pred = int(row["anom_pred"].iloc[0])
 
-    if int(row["anom_pred"].iloc[0]) == 1:
-        topk = rca_topk(rca_model, row[feats], k=3)
-        st.dataframe(topk, use_container_width=True)
-        if using_labels:
-            st.caption(f"Ground truth causes: {row['cause'].iloc[0]}")
+    st.write(f"Minute bucket: [{minute_val}, {minute_val + 60})")
+    st.write(f"Anomaly probability: {anom_prob:.3f} | pred: {anom_pred}")
+
+    # Ground truth availability
+    gt_available = using_labels and ("cause" in row.columns)
+    gt_raw = str(row["cause"].iloc[0]) if gt_available else ""
+    gt_list = [x.strip().upper() for x in gt_raw.split(";") if x.strip()]
+    gt_set = set(gt_list)
+
+    # RCA top-1/top-3
+    probs = rca_model.predict_proba(row[feats])[0]
+    classes = list(rca_model.classes_)
+    top_idx = np.argsort(probs)[::-1]
+    top1 = str(classes[top_idx[0]])
+    top3 = pd.DataFrame(
+        {
+            "Likely cause": [str(classes[i]) for i in top_idx[:3]],
+            "Probability": [float(probs[i]) for i in top_idx[:3]],
+        }
+    )
+
+    if anom_pred == 1:
+        st.dataframe(top3, use_container_width=True)
+
+        if gt_available:
+            # Show all ground-truth causes (if multiple)
+            truth_display = ", ".join(sorted(gt_set)) if gt_set else "NORMAL"
+            truth_df = pd.DataFrame({"Ground truth causes": sorted(gt_set)}) if len(gt_set) > 0 else pd.DataFrame({"Ground truth causes": ["NORMAL"]})
+
+            # Match rule: top-1 must appear in ground truth list (multi-cause supported)
+            is_correct = (top1.upper() in gt_set) if len(gt_set) else (top1.upper() == "NORMAL")
+            match_html = html_badge("Correct", "rca-correct") if is_correct else html_badge("Incorrect", "rca-incorrect")
+
+            c1, c2, c3 = st.columns([1, 2, 1])
+            c1.metric("Predicted (top-1)", top1)
+            c2.metric("Ground truth", truth_display)
+            with c3:
+                st.markdown("**RCA match**")
+                st.markdown(match_html, unsafe_allow_html=True)
+
+            if len(gt_set) > 1:
+                st.dataframe(truth_df, use_container_width=True, hide_index=True)
+
+            st.markdown(
+                "<div class='small-note'>RCA match rule: top-1 prediction is correct if it appears in the ground-truth cause list.</div>",
+                unsafe_allow_html=True
+            )
+        else:
+            st.caption("No ground-truth labels available for this row. Upload Labels CSV to enable correctness check.")
     else:
-        st.info("Not predicted anomalous. Switch to anomaly-only mode for RCA minutes.")
+        st.info("This minute is not predicted anomalous. Switch to anomaly-only mode to focus RCA on anomalies.")
+        if gt_available and len(gt_set) > 0 and ("NORMAL" not in gt_set):
+            st.write(f"Ground truth indicates issue: {', '.join(sorted(gt_set))}")
 
     st.subheader("Telemetry around selected minute (linked)")
     window_s = st.slider("Plot window (seconds)", 120, 900, 300, 60)
@@ -716,7 +743,8 @@ with tab_plots:
         fig = plt.figure(figsize=(5, 4))
         ax = plt.gca()
         ax.imshow(cm)
-        ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+        ax.set_xticks([0, 1])
+        ax.set_yticks([0, 1])
         ax.set_xticklabels(["Normal", "Anomaly"])
         ax.set_yticklabels(["Normal", "Anomaly"])
         for (i, j), val in np.ndenumerate(cm):
