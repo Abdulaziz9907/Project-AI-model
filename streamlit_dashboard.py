@@ -1,19 +1,22 @@
 """
 streamlit_dashboard.py — Proof-of-Spec Dashboard (FULL)
 
-Updates included:
-- Run does NOT happen until "Run (train model)" is pressed.
-- Cross-device Streamlit caching fix:
-  - Cache by CSV bytes (not DataFrames) to avoid UnhashableParamError.
-- Spec table PASS/FAIL shown in green/red (no emojis).
-- RCA "Correct/Incorrect" shown in green/red (no emojis).
-- If multiple ground-truth causes exist, they are all displayed (list + joined text).
-- Overview includes a collapsed expander explaining how each spec is calculated.
+Includes:
+- Train split slider + split mode toggle (Time-based vs Random)
+- Run does NOT happen until Run button is pressed
+- Cross-device caching fix: cache CSV bytes (not DataFrames)
+- Spec table PASS/FAIL colored green/red (no emojis)
+- RCA match Correct/Incorrect colored green/red (no emojis)
+- Multiple ground-truth causes displayed if present (semicolon-separated)
+- Spec calculation explanation in Overview tab (collapsed by default)
+- Option B: "Anomaly density (simulated)" slider (target % anomalous minute-buckets)
+- Progress UI during Run, then removed after completion
 """
 
 from __future__ import annotations
 
 import io
+import time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -39,6 +42,7 @@ EXPECTED_CAUSES = [
     "HTTPS_SLOW",
     "HTTPS_OUTAGE",
 ]
+
 
 # -----------------------------
 # Page config / styles
@@ -85,11 +89,6 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
 # Cached helpers (cache bytes, not DataFrames)
 # -----------------------------
 @st.cache_data(show_spinner=False)
-def cached_simulate(cfg_dict: dict):
-    return simulate(SimConfig(**cfg_dict))
-
-
-@st.cache_data(show_spinner=False)
 def cached_features_from_csv(snmp_csv: bytes, probes_csv: bytes) -> pd.DataFrame:
     snmp = bytes_to_df(snmp_csv)
     probes = bytes_to_df(probes_csv)
@@ -97,9 +96,14 @@ def cached_features_from_csv(snmp_csv: bytes, probes_csv: bytes) -> pd.DataFrame
 
 
 @st.cache_resource(show_spinner=False)
-def cached_train_from_csv(ds_csv: bytes):
+def cached_train_from_csv(ds_csv: bytes, model_seed: int, train_fraction: float, split_mode: str):
     ds = bytes_to_df(ds_csv)
-    return train_anomaly_and_rca(ds)
+    return train_anomaly_and_rca(
+        ds,
+        seed=int(model_seed),
+        train_fraction=float(train_fraction),
+        split_mode=str(split_mode),
+    )
 
 
 # -----------------------------
@@ -274,6 +278,13 @@ def html_badge(text: str, cls: str) -> str:
     return f"<span class='{cls}'>{text}</span>"
 
 
+def fmt_mmss(seconds: float) -> str:
+    s = int(max(0, round(seconds)))
+    mm = s // 60
+    ss = s % 60
+    return f"{mm:02d}:{ss:02d}"
+
+
 # -----------------------------
 # Sidebar
 # -----------------------------
@@ -282,14 +293,40 @@ snmp_t, probes_t, labels_t = make_templates()
 with st.sidebar:
     st.header("Simulation Settings (train model)")
     with st.form("sim_form"):
-        duration = st.slider("Duration (minutes)", 60, 720, 240, 60,
-                             help="Length of simulated timeline used for training/verification in 'Simulated' mode.")
+        duration = st.slider(
+            "Duration (minutes)",
+            60, 3000, 240, 60,
+            help="Total simulated timeline length in MINUTES (not seconds). Example: 3000 = 50 hours."
+        )
         buildings = st.slider("Buildings", 2, 20, 8, 1,
                               help="Number of buildings (sites) in simulated training data.")
         aps = st.slider("APs per building", 5, 50, 14, 1,
                         help="Number of access points per building in simulated SNMP inventory.")
         seed = st.number_input("Random seed", value=7, step=1,
                                help="Controls simulation randomness. Same seed → same dataset.")
+
+        anomaly_target_pct = st.slider(
+            "Anomaly density (simulated)",
+            0.0, 50.0, 5.0, 1.0,
+            help=(
+                "Target % of (minute × building) buckets labeled anomalous in SIMULATED data. "
+                "Example: 5 means ~5% of minute-buckets will be anomalous."
+            )
+        )
+
+        train_fraction = st.slider(
+            "Train split (fraction)",
+            0.50, 0.90, 0.70, 0.05,
+            help="Fraction of data used for training. Example: 0.70 = 70% train, 30% test."
+        )
+
+        split_mode_ui = st.radio(
+            "Split mode",
+            ["Time-based", "Random"],
+            horizontal=True,
+            help="Time-based: train early minutes, test later minutes. Random: shuffle rows before splitting."
+        )
+        split_mode = "time" if split_mode_ui == "Time-based" else "random"
 
         snmp_interval = st.selectbox("SNMP interval (S1)", [60, 30, 15], index=0,
                                      help="SNMP polling interval (seconds). S1 expects ≤ 60s.")
@@ -304,7 +341,7 @@ with st.sidebar:
                                  help="Random +/- jitter added to simulated probe timestamps (SIMULATED only).")
 
         include_http = st.checkbox("Simulate HTTP/HTTPS probes", value=True,
-                                   help="Adds HTTP/HTTPS to simulated probe data (and features if present).")
+                                   help="Adds HTTP/HTTPS to simulated probe data.")
 
         st.divider()
         run_btn = st.form_submit_button("Run (train model)")
@@ -314,9 +351,11 @@ with st.sidebar:
     data_source = st.radio("Choose source", ["Simulated", "Uploaded CSV"],
                            help="Uploaded scores your CSV using the trained model.")
 
-    strict_services = st.checkbox("Strict: require DNS, DHCP, LMS, WIFI in probes",
-                                  value=True if data_source == "Uploaded CSV" else False,
-                                  help="If enabled, uploaded probes must include these core services.")
+    strict_services = st.checkbox(
+        "Strict: require DNS, DHCP, LMS, WIFI in probes",
+        value=True if data_source == "Uploaded CSV" else False,
+        help="If enabled, uploaded probes must include these core services."
+    )
 
     snmp_upload = probes_upload = labels_upload = None
     if data_source == "Uploaded CSV":
@@ -373,24 +412,42 @@ with tab_templates:
 
 
 # -----------------------------
-# Training (only on button press)
+# Training (only on button press) + progress UI (removed after completion)
 # -----------------------------
 if run_btn:
-    cfg_dict = dict(
+    # progress placeholders
+    prog_box = st.empty()
+    prog_text = st.empty()
+    prog_eta = st.empty()
+    bar = prog_box.progress(0)
+
+    t0 = time.perf_counter()
+
+    def progress_cb(p: float, msg: str):
+        bar.progress(int(max(0, min(1, p)) * 100))
+        prog_text.markdown(f"**{msg}**")
+        elapsed = time.perf_counter() - t0
+        if p > 0.02:
+            total = elapsed / max(p, 1e-6)
+            remaining = max(0.0, total - elapsed)
+            prog_eta.markdown(f"Estimated remaining: **{fmt_mmss(remaining)}**")
+
+    cfg = SimConfig(
         duration_minutes=int(duration),
         n_buildings=int(buildings),
         n_aps_per_building=int(aps),
-        seed=int(seed),
         snmp_interval_s=int(snmp_interval),
         probe_interval_s=int(probe_interval),
         probe_phase_offset_s=int(probe_phase),
         snmp_jitter_s=int(snmp_jitter),
         probe_jitter_s=int(probe_jitter),
         include_http_https=bool(include_http),
+        seed=int(seed),
+        anomaly_target_pct=float(anomaly_target_pct),
     )
 
-    with st.spinner("Simulating training data + training models..."):
-        dev_tr, snmp_tr, probes_tr, labels_tr, events_tr = cached_simulate(cfg_dict)
+    try:
+        dev_tr, snmp_tr, probes_tr, labels_tr, events_tr = simulate(cfg, progress_cb=progress_cb)
 
         feat_tr = cached_features_from_csv(
             df_to_csv_bytes_stable(snmp_tr),
@@ -402,13 +459,23 @@ if run_btn:
         ds_tr["cause"] = ds_tr["cause"].fillna("")
         ds_tr["primary_cause"] = ds_tr["cause"].apply(primary_cause)
 
-        model_out = cached_train_from_csv(df_to_csv_bytes_stable(ds_tr))
+        model_out = cached_train_from_csv(
+            df_to_csv_bytes_stable(ds_tr),
+            model_seed=int(seed),
+            train_fraction=float(train_fraction),
+            split_mode=str(split_mode),
+        )
 
         st.session_state["trained"] = {
-            "cfg_dict": cfg_dict,
+            "cfg": cfg,
             "model_out": model_out,
             "train_data": (snmp_tr, probes_tr, labels_tr, events_tr, ds_tr),
         }
+    finally:
+        # remove progress UI after completion (or error)
+        prog_box.empty()
+        prog_text.empty()
+        prog_eta.empty()
 
 # Not trained yet: templates usable; other tabs guide user
 if "trained" not in st.session_state:
@@ -430,7 +497,7 @@ if "trained" not in st.session_state:
 # Use trained artifacts
 # -----------------------------
 trained = st.session_state["trained"]
-cfg_dict = trained["cfg_dict"]
+cfg: SimConfig = trained["cfg"]
 model_out = trained["model_out"]
 feats = model_out["features"]
 anom_model = model_out["anomaly_model"]
@@ -511,14 +578,14 @@ if "cause" not in ds.columns:
 if "primary_cause" not in ds.columns:
     ds["primary_cause"] = ""
 
-split = model_out["split_minute"]
-ds_test = ds[ds.minute > split].copy().reset_index(drop=True)
-
-# probes_for_spec must match probes used for scoring (so INT2 and plots match)
+# Spec + plot consistency
 probes_for_spec = probes_for_scoring
 
+split_minute = model_out["split_minute"]
+ds_test = ds[ds.minute > split_minute].copy().reset_index(drop=True)
+
 spec_df = build_spec_table(
-    SimConfig(**cfg_dict),
+    cfg,
     model_out,
     ds,
     ds_test,
@@ -548,9 +615,9 @@ with tab_overview:
     def top1_cause_scalar(r):
         if int(r["anom_pred"]) != 1:
             return "NORMAL"
-        probs = rca_model.predict_proba(r[feats].to_frame().T)[0]
-        classes = list(rca_model.classes_)
-        return str(classes[int(np.argmax(probs))])
+        pr = rca_model.predict_proba(r[feats].to_frame().T)[0]
+        cls = list(rca_model.classes_)
+        return str(cls[int(np.argmax(pr))])
 
     latest["likely_cause_top1"] = latest.apply(top1_cause_scalar, axis=1)
     st.dataframe(
@@ -583,54 +650,26 @@ with tab_overview:
 
     with st.expander("How each specification is calculated (rules used by this dashboard)", expanded=False):
         st.markdown(
-            """
-This dashboard computes the proof table using `ai_verify.build_spec_table(...)`.
-Below is the rule-level definition used by this demo.
+            f"""
+Split rule (affects confusion matrix size during training evaluation):
+- Split mode: **{model_out.get('split_mode','time')}**
+- Train fraction: **{model_out.get('train_fraction', 0.70):.2f}**
+- split_minute (time-based): **{model_out.get('split_minute', 0)}**
 
-S1 — SNMP Poll Interval
-- Measured: `cfg.snmp_interval_s`
-- Pass: `snmp_interval_s ≤ 60`
+INT2 correlation rule:
+- For each SNMP timestamp t_SNMP (per building), pick nearest probe timestamp t_probe (same building)
+- alignment_error = |t_SNMP − t_probe|
+- INT2 measured = max(alignment_error) across all samples/buildings
+- PASS if ≤ 5 seconds
 
-S2 — Dashboard Query Time
-- Measured: average time to run a dashboard-like aggregation over the per-minute dataset
-- Typical operation: `groupby(building).mean()` on common columns
-- Pass: `< 10 seconds`
+Option B (anomaly density):
+- Target anomaly density: **{cfg.anomaly_target_pct:.1f}%**
+- Meaning: aim for that % of (minute × building) buckets to have at least one ground-truth event
 
-S3a / S3b — Anomaly Detection Quality
-- Measured: precision and recall on the test split (simulated labels; or uploaded labels if provided)
-- Pass: per your report thresholds
-
-S5 — Root Cause Analysis Time
-- Measured: time to run RCA inference (`predict_proba`) over a small batch of anomalous rows
-- Pass: `≤ 50 seconds`
-
-S6 — Probe Interval
-- Measured: `cfg.probe_interval_s`
-- Pass: `< 15 seconds`
-
-S7 — Duplicate Alert Reduction
-- Raw alerts: probe failures + probe SLA violations + SNMP congestion/errors/down signals
-- Dedup alerts: unique incidents by `(building, minute)` after correlation
-- Measured: `reduction% = (raw - dedup) / raw × 100`
-- Pass: `≥ 30%`
-
-S8 — Feature-Build Throughput
-- Measured: records/sec throughput of building minute features from SNMP + probes
-- Pass: `≥ 50 records/sec` (or your report threshold)
-
-INT1 — Detection Latency
-- Simulated-only: worst-case time between injected event start and first predicted anomaly minute
-- Pass: `≤ 120 seconds`
-
-INT2 — Timestamp Alignment (Correlation)
-For each SNMP timestamp `t_SNMP` (per building), select the nearest probe timestamp `t_probe` (same building):
-- `alignment_error = |t_SNMP - t_probe|`
-- Measured INT2 = `max(alignment_error)` over all samples/buildings
-- Pass: `≤ 5 seconds`
-
-Note:
-- In Uploaded CSV mode, simulation jitter/phase does not change uploaded timestamps.
-- To demonstrate sensitivity, enable “Uploaded data testing knobs”.
+S7 duplicate alert reduction:
+- raw alerts count vs deduplicated incident tickets per (building, minute)
+- reduction% = (raw − dedup)/raw × 100
+- PASS if ≥ 30%
 """
         )
 
@@ -638,7 +677,6 @@ Note:
     spec_show["Pass"] = spec_show["Pass"].apply(
         lambda x: html_badge("PASS", "spec-pass") if x else html_badge("FAIL", "spec-fail")
     )
-
     st.markdown("<div class='big-spec-table'>", unsafe_allow_html=True)
     st.markdown(spec_show.to_html(index=False, escape=False), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
@@ -677,17 +715,16 @@ with tab_rca:
     st.write(f"Minute bucket: [{minute_val}, {minute_val + 60})")
     st.write(f"Anomaly probability: {anom_prob:.3f} | pred: {anom_pred}")
 
-    # Ground truth availability
     gt_available = using_labels and ("cause" in row.columns)
     gt_raw = str(row["cause"].iloc[0]) if gt_available else ""
     gt_list = [x.strip().upper() for x in gt_raw.split(";") if x.strip()]
     gt_set = set(gt_list)
 
-    # RCA top-1/top-3
     probs = rca_model.predict_proba(row[feats])[0]
     classes = list(rca_model.classes_)
     top_idx = np.argsort(probs)[::-1]
     top1 = str(classes[top_idx[0]])
+
     top3 = pd.DataFrame(
         {
             "Likely cause": [str(classes[i]) for i in top_idx[:3]],
@@ -699,26 +736,28 @@ with tab_rca:
         st.dataframe(top3, use_container_width=True)
 
         if gt_available:
-            # Show all ground-truth causes (if multiple)
-            truth_display = ", ".join(sorted(gt_set)) if gt_set else "NORMAL"
-            truth_df = pd.DataFrame({"Ground truth causes": sorted(gt_set)}) if len(gt_set) > 0 else pd.DataFrame({"Ground truth causes": ["NORMAL"]})
+            truth_list_sorted = sorted(gt_set) if len(gt_set) else ["NORMAL"]
+            truth_display = ", ".join(truth_list_sorted)
 
-            # Match rule: top-1 must appear in ground truth list (multi-cause supported)
             is_correct = (top1.upper() in gt_set) if len(gt_set) else (top1.upper() == "NORMAL")
             match_html = html_badge("Correct", "rca-correct") if is_correct else html_badge("Incorrect", "rca-incorrect")
 
             c1, c2, c3 = st.columns([1, 2, 1])
             c1.metric("Predicted (top-1)", top1)
-            c2.metric("Ground truth", truth_display)
+            c2.metric("Ground truth (all causes)", truth_display)
             with c3:
                 st.markdown("**RCA match**")
                 st.markdown(match_html, unsafe_allow_html=True)
 
-            if len(gt_set) > 1:
-                st.dataframe(truth_df, use_container_width=True, hide_index=True)
+            if len(truth_list_sorted) > 1:
+                st.dataframe(
+                    pd.DataFrame({"Ground truth causes": truth_list_sorted}),
+                    use_container_width=True,
+                    hide_index=True
+                )
 
             st.markdown(
-                "<div class='small-note'>RCA match rule: top-1 prediction is correct if it appears in the ground-truth cause list.</div>",
+                "<div class='small-note'>Rule: top-1 is Correct if it appears in the ground-truth cause list.</div>",
                 unsafe_allow_html=True
             )
         else:
@@ -737,8 +776,15 @@ with tab_rca:
 # Plots tab
 # -----------------------------
 with tab_plots:
-    st.subheader("Confusion matrix (labels only)")
-    if using_labels and ("y_test" in model_out) and ("y_pred" in model_out):
+    st.subheader("Confusion matrix (training evaluation)")
+
+    if ("y_test" in model_out) and ("y_pred" in model_out):
+        st.caption(
+            f"Split mode: {model_out.get('split_mode','time')} | "
+            f"Train fraction: {model_out.get('train_fraction', 0.70):.2f} | "
+            f"Test rows: {len(model_out['y_test']):,} | Total per-minute rows: {len(ds):,}"
+        )
+
         cm = confusion(model_out["y_test"], model_out["y_pred"])
         fig = plt.figure(figsize=(5, 4))
         ax = plt.gca()
@@ -754,4 +800,4 @@ with tab_plots:
         ax.set_ylabel("True")
         st.pyplot(fig)
     else:
-        st.info("Upload Labels CSV to compute confusion matrix (or use Simulated mode).")
+        st.info("Train first using Run (train model).")
